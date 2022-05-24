@@ -9,3 +9,5 @@ lint: fmt
 build:
     cargo build
 run-ci: lint build test
+gen-spec:
+    cargo run --features gen-spec --bin gen-spec
