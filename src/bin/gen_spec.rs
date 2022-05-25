@@ -4,23 +4,31 @@ use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
-use syn::{Item, ItemFn, ItemUse};
+use syn::{
+    AngleBracketedGenericArguments, ConstParam, GenericArgument, GenericParam, Ident, Item, ItemFn,
+    ItemUse, PatType, PathArguments, PathSegment, Type, TypePath,
+};
 
+const ATTESTATION_BOUND_IDENT: &str = "PENDING_ATTESTATIONS_BOUND";
+const SYNC_COMMITTEE_SIZE_IDENT: &str = "SYNC_COMMITTEE_SIZE";
 const SPEC_IMPORT: &str = "use crate::phase0 as spec;";
 const GENERATION_WARNING: &str =
     "// WARNING: This file was derived by the `gen-spec` utility. DO NOT EDIT MANUALLY.\n\n";
 
 enum Pass {
     RemoveOverrides,
+    FixGenerics,
     ImportOverrides,
     Finalize,
 }
 
 struct Editor {
     overrides: HashSet<String>,
+    pattern_to_expire: String,
     pass: Pass,
     target_fork_module: String,
     source_module: String,
+    extend_for_block: bool,
 }
 
 impl<'ast> Visit<'ast> for Editor {
@@ -31,6 +39,57 @@ impl<'ast> Visit<'ast> for Editor {
 }
 
 impl VisitMut for Editor {
+    fn visit_angle_bracketed_generic_arguments_mut(
+        &mut self,
+        node: &mut AngleBracketedGenericArguments,
+    ) {
+        match self.pass {
+            Pass::FixGenerics => {
+                if self.extend_for_block {
+                    let arg: Type = syn::parse_str("SYNC_COMMITTEE_SIZE").unwrap();
+                    node.args.push(GenericArgument::Type(arg));
+                }
+            }
+            _ => {}
+        }
+        syn::visit_mut::visit_angle_bracketed_generic_arguments_mut(self, node);
+    }
+
+    // `sed` in `syn`
+    fn visit_ident_mut(&mut self, node: &mut Ident) {
+        match self.pass {
+            Pass::FixGenerics => {
+                let target_ident: Ident = syn::parse_str(&ATTESTATION_BOUND_IDENT).unwrap();
+                if node == &target_ident {
+                    let replacement: Ident = syn::parse_str(&SYNC_COMMITTEE_SIZE_IDENT).unwrap();
+                    *node = replacement;
+                }
+            }
+            _ => {}
+        }
+        syn::visit_mut::visit_ident_mut(self, node);
+    }
+
+    fn visit_path_segment_mut(&mut self, node: &mut PathSegment) {
+        match self.pass {
+            Pass::FixGenerics => {
+                let ident = node.ident.to_string();
+                if ident.contains("BeaconBlock") {
+                    match &mut node.arguments {
+                        PathArguments::AngleBracketed(args) => {
+                            self.extend_for_block = true;
+                            self.visit_angle_bracketed_generic_arguments_mut(args);
+                            self.extend_for_block = false;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        syn::visit_mut::visit_path_segment_mut(self, node);
+    }
+
     fn visit_file_mut(&mut self, node: &mut syn::File) {
         match self.pass {
             Pass::RemoveOverrides => {
@@ -41,7 +100,10 @@ impl VisitMut for Editor {
                     .filter_map(|(i, item)| match item {
                         Item::Fn(node) => {
                             let fn_name = node.sig.ident.to_string();
-                            if self.overrides.contains(&fn_name) {
+                            let is_overriden = self.overrides.contains(&fn_name);
+                            let is_expired = fn_name.starts_with(&self.pattern_to_expire);
+                            let should_drop = is_overriden || is_expired;
+                            if should_drop {
                                 Some(i)
                             } else {
                                 None
@@ -50,10 +112,13 @@ impl VisitMut for Editor {
                         _ => None,
                     })
                     .collect::<Vec<_>>();
+                let mut removed = 0;
                 for index in indices_to_remove {
-                    node.items.remove(index);
+                    node.items.remove(index - removed);
+                    removed += 1;
                 }
             }
+            Pass::FixGenerics => {}
             Pass::ImportOverrides => {
                 let mut iter = node
                     .items
@@ -66,7 +131,7 @@ impl VisitMut for Editor {
                     let src_mod = &self.source_module;
                     let target_fork_mod = &self.target_fork_module;
                     let use_item: ItemUse = syn::parse_str(&format!(
-                        "use {src_mod}_{target_fork_mod}::{ident} as {ident};"
+                        "pub use crate::{target_fork_mod}::{src_mod}_{target_fork_mod}::{ident} as {ident};"
                     ))
                     .unwrap();
                     node.items
@@ -97,38 +162,45 @@ impl VisitMut for Editor {
                 node.items[target_index] = replacement.into();
             }
         }
+        syn::visit_mut::visit_file_mut(self, node);
     }
 }
 
-fn merge(
+fn assemble(
     target_fork_module: &str,
     source_module: &str,
     base_src: &str,
     overrides_src: Option<String>,
 ) -> syn::File {
-    let mut merger = Editor {
+    let mut editor = Editor {
         overrides: Default::default(),
+        pattern_to_expire: "get_matching_".to_string(),
         pass: Pass::RemoveOverrides,
         target_fork_module: target_fork_module.to_string(),
         source_module: source_module.to_string(),
+        extend_for_block: false,
     };
 
     if let Some(overrides_src) = overrides_src {
         let overrides = syn::parse_str::<syn::File>(&overrides_src).unwrap();
-        merger.visit_file(&overrides);
+        editor.visit_file(&overrides);
     }
 
     // Remove overrides from base
     let mut base = syn::parse_str::<syn::File>(base_src).unwrap();
-    merger.visit_file_mut(&mut base);
+    editor.visit_file_mut(&mut base);
+
+    // Fix generics
+    editor.pass = Pass::FixGenerics;
+    editor.visit_file_mut(&mut base);
 
     // Import overrides from supplemental module
-    merger.pass = Pass::ImportOverrides;
-    merger.visit_file_mut(&mut base);
+    editor.pass = Pass::ImportOverrides;
+    editor.visit_file_mut(&mut base);
 
     // Finalize any remaining edits...
-    merger.pass = Pass::Finalize;
-    merger.visit_file_mut(&mut base);
+    editor.pass = Pass::Finalize;
+    editor.visit_file_mut(&mut base);
 
     base
 }
@@ -153,7 +225,7 @@ fn render(
     };
 
     let src_src = fs::read_to_string(src_path).unwrap();
-    let target = merge(target_fork_module, source_module, &src_src, patch_src);
+    let target = assemble(target_fork_module, source_module, &src_src, patch_src);
     let dest_src = prettyplease::unparse(&target);
     let mut output = String::from(GENERATION_WARNING);
     output.push_str(&dest_src);
